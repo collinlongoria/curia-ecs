@@ -25,13 +25,21 @@ class World {
     std::vector<EntityRecord> entity_directory;
     std::vector<std::unique_ptr<Archetype>> archetypes;
 
-    // free list for recycled entity indices
     std::vector<uint32_t> free_indices;
 
-    // the empty archetype new entities start in
     Archetype* empty_archetype = nullptr;
 
-    Archetype* find_or_create_archetype(std::vector<ComponentID> sig, const std::unordered_map<ComponentID, size_t>& sizes) {
+    // global flat array of component sizes, indexed by ComponentID
+    std::vector<size_t> global_component_sizes;
+
+    void register_component_size(ComponentID cid, size_t sz) {
+        if (cid >= global_component_sizes.size()) {
+            global_component_sizes.resize(cid + 1, 0);
+        }
+        global_component_sizes[cid] = sz;
+    }
+
+    Archetype* find_or_create_archetype(std::vector<ComponentID> sig) {
         std::sort(sig.begin(), sig.end());
         for (auto& a : archetypes) {
             if (a->signature == sig) return a.get();
@@ -39,22 +47,12 @@ class World {
         auto a = std::make_unique<Archetype>();
         a->signature = sig;
         for (auto cid : sig) {
-            a->component_sizes[cid] = sizes.at(cid);
+            a->set_component_size(cid, global_component_sizes[cid]);
         }
         Archetype::compute_layout(*a);
         Archetype* ptr = a.get();
         archetypes.push_back(std::move(a));
         return ptr;
-    }
-
-
-    // gathers all known component sizes from an existing archetype + extras
-    static std::unordered_map<ComponentID, size_t> gather_sizes(const Archetype* arch) {
-        std::unordered_map<ComponentID, size_t> sizes;
-        if (arch) {
-            sizes = arch->component_sizes;
-        }
-        return sizes;
     }
 
     void move_entity(Entity e, EntityRecord& record, Archetype* dst_arch) {
@@ -63,25 +61,21 @@ class World {
         uint32_t src_row = record.row_index;
         Chunk* src_chunk = src_arch->chunks[src_ci].get();
 
-        // allocate in destination
         auto [dst_ci, dst_row] = dst_arch->allocate_row(e);
         Chunk* dst_chunk = dst_arch->chunks[dst_ci].get();
 
-        // copy shared components
         for (auto cid : src_arch->signature) {
-            if (dst_arch->component_offsets.count(cid)) {
+            if (dst_arch->has_component(cid)) {
                 dst_arch->copy_component(cid, dst_chunk, dst_row, src_chunk, src_row, *src_arch);
             }
         }
 
-        // swap-and-pop the old slot
         Entity moved = src_arch->remove_row(src_ci, src_row);
         if (moved != INVALID_ENTITY) {
             uint32_t moved_idx = EntityTraits::get_index(moved);
             entity_directory[moved_idx].row_index = src_row;
         }
 
-        // update record
         record.archetype = dst_arch;
         record.chunk_index = dst_ci;
         record.row_index = dst_row;
@@ -103,8 +97,7 @@ public:
             index = free_indices.back();
             free_indices.pop_back();
             generation = entity_directory[index].generation;
-        }
-        else {
+        } else {
             index = static_cast<uint32_t>(entity_directory.size());
             entity_directory.push_back({});
             generation = 0;
@@ -124,7 +117,8 @@ public:
     bool alive(Entity e) const {
         uint32_t idx = EntityTraits::get_index(e);
         if (idx >= entity_directory.size()) return false;
-        return entity_directory[idx].generation == EntityTraits::get_generation(e) && entity_directory[idx].archetype != nullptr;
+        return entity_directory[idx].generation == EntityTraits::get_generation(e)
+            && entity_directory[idx].archetype != nullptr;
     }
 
     void destroy(Entity e) {
@@ -150,22 +144,17 @@ public:
         EntityRecord& record = entity_directory[idx];
 
         ComponentID cid = ComponentType<T>::id();
+        register_component_size(cid, sizeof(T));
 
-        // already has this component?
-        if (record.archetype->component_offsets.count(cid)) return;
+        if (record.archetype->has_component(cid)) return;
 
-        // build new signature
         std::vector<ComponentID> new_sig = record.archetype->signature;
         new_sig.push_back(cid);
 
-        auto sizes = gather_sizes(record.archetype);
-        sizes[cid] = sizeof(T);
-
-        Archetype* dst = find_or_create_archetype(std::move(new_sig), sizes);
+        Archetype* dst = find_or_create_archetype(std::move(new_sig));
 
         move_entity(e, record, dst);
 
-        // write the new component data
         Chunk* chunk = dst->chunks[record.chunk_index].get();
         dst->write_component(cid, chunk, record.row_index, &component_data);
     }
@@ -178,21 +167,18 @@ public:
 
         ComponentID cid = ComponentType<T>::id();
 
-        if (!record.archetype->component_offsets.count(cid)) return;
+        if (!record.archetype->has_component(cid)) return;
 
         std::vector<ComponentID> new_sig;
         for (auto c : record.archetype->signature) {
             if (c != cid) new_sig.push_back(c);
         }
 
-        auto sizes = gather_sizes(record.archetype);
-
         Archetype* dst;
         if (new_sig.empty()) {
             dst = empty_archetype;
-        }
-        else {
-            dst = find_or_create_archetype(std::move(new_sig), sizes);
+        } else {
+            dst = find_or_create_archetype(std::move(new_sig));
         }
 
         move_entity(e, record, dst);
@@ -203,7 +189,7 @@ public:
         if (!alive(e)) return false;
         uint32_t idx = EntityTraits::get_index(e);
         const EntityRecord& record = entity_directory[idx];
-        return record.archetype->component_offsets.count(ComponentType<T>::id()) > 0;
+        return record.archetype->has_component(ComponentType<T>::id());
     }
 
     template <IsValidComponent T>
@@ -212,10 +198,11 @@ public:
         uint32_t idx = EntityTraits::get_index(e);
         EntityRecord& record = entity_directory[idx];
         ComponentID cid = ComponentType<T>::id();
-        if (!record.archetype->component_offsets.count(cid)) return nullptr;
+        if (!record.archetype->has_component(cid)) return nullptr;
 
         Chunk* chunk = record.archetype->chunks[record.chunk_index].get();
-        size_t offset = record.archetype->component_offsets.at(cid) + record.row_index * sizeof(T);
+        size_t offset = record.archetype->component_offsets[cid]
+                      + record.row_index * sizeof(T);
         return reinterpret_cast<T*>(chunk->data + offset);
     }
 
@@ -225,10 +212,11 @@ public:
         uint32_t idx = EntityTraits::get_index(e);
         const EntityRecord& record = entity_directory[idx];
         ComponentID cid = ComponentType<T>::id();
-        if (!record.archetype->component_offsets.count(cid)) return nullptr;
+        if (!record.archetype->has_component(cid)) return nullptr;
 
         const Chunk* chunk = record.archetype->chunks[record.chunk_index].get();
-        size_t offset = record.archetype->component_offsets.at(cid) + record.row_index * sizeof(T);
+        size_t offset = record.archetype->component_offsets[cid]
+                      + record.row_index * sizeof(T);
         return reinterpret_cast<const T*>(chunk->data + offset);
     }
 
@@ -266,4 +254,4 @@ public:
 
 }
 
-#endif //CURIA_WORLD_HPP
+#endif

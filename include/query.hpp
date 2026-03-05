@@ -16,10 +16,7 @@ class Query {
     std::vector<Archetype*> matching_archetypes;
 
     static bool archetype_matches(const Archetype* arch) {
-        auto has = [&](ComponentID cid) {
-            return arch->component_offsets.count(cid) > 0;
-        };
-        return (has(ComponentType<Components>::id()) && ...);
+        return (arch->has_component(ComponentType<Components>::id()) && ...);
     }
 
 public:
@@ -40,7 +37,7 @@ public:
                 Chunk* chunk = chunk_ptr.get();
                 auto arrays = std::make_tuple(
                     static_cast<Components*>(chunk->get_array(
-                        arch->component_offsets.at(ComponentType<Components>::id())))...
+                        arch->component_offsets[ComponentType<Components>::id()]))...
                 );
                 for (uint32_t i = 0; i < chunk->entity_count; ++i) {
                     callback(std::get<Components*>(arrays)[i]...);
@@ -64,7 +61,7 @@ public:
                 auto [arch, chunk] = item;
                 auto arrays = std::make_tuple(
                     static_cast<Components*>(chunk->get_array(
-                        arch->component_offsets.at(ComponentType<Components>::id())))...
+                        arch->component_offsets[ComponentType<Components>::id()]))...
                 );
                 for (uint32_t i = 0; i < chunk->entity_count; ++i) {
                     callback(std::get<Components*>(arrays)[i]...);
@@ -81,7 +78,7 @@ public:
                 Chunk* chunk = arch->chunks[ci].get();
                 auto arrays = std::make_tuple(
                     static_cast<Components*>(chunk->get_array(
-                        arch->component_offsets.at(ComponentType<Components>::id())))...
+                        arch->component_offsets[ComponentType<Components>::id()]))...
                 );
                 for (uint32_t i = 0; i < chunk->entity_count; ++i) {
                     Entity e = arch->entities_in_chunk[ci][i];
