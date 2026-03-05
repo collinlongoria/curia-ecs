@@ -7,7 +7,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Executable
 add_library(curia_ecs STATIC
-        src/World.cpp)
+        src/curia.cpp
+)
 target_include_directories(curia_ecs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if(MSVC)
@@ -15,6 +16,16 @@ if(MSVC)
 else()
     target_compile_options(curia_ecs PRIVATE $<$<CONFIG:Release>:-O3 -march=native -ffast-math>)
 endif()
+
+# TBB for std::execution parallel policies
+find_package(TBB QUIET)
+if(TBB_FOUND)
+    target_link_libraries(curia_ecs PUBLIC TBB::tbb)
+endif()
+
+# test
+add_executable(curia_test tests/basic_tests.cpp)
+target_link_libraries(curia_test PRIVATE curia_ecs)
 
 include(FetchContent)
 FetchContent_Declare(

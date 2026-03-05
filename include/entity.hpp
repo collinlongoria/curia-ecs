@@ -6,6 +6,7 @@
 namespace curia {
 
 using Entity = uint64_t;
+static constexpr Entity INVALID_ENTITY = ~Entity(0);
 
 struct EntityTraits {
     static constexpr uint32_t get_index(Entity e) { return static_cast<uint32_t>(e); }
