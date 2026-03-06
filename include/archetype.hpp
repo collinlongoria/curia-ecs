@@ -21,7 +21,6 @@ struct Archetype {
 
     std::vector<std::vector<Entity>> entities_in_chunk;
 
-    // flat arrays indexed by ComponentID, INVALID_OFFSET means not present
     std::vector<size_t> component_offsets;
     std::vector<size_t> component_sizes;
 
