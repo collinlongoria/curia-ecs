@@ -1,135 +1,120 @@
 #ifndef CURIA_COMMAND_BUFFER_HPP
 #define CURIA_COMMAND_BUFFER_HPP
 
-#include <functional>
-#include <mutex>
+#include <memory>
 #include <vector>
+#include <utility>
+#include <limits>
 
 #include "component.hpp"
 #include "entity.hpp"
 #include "world.hpp"
 
-
 namespace curia {
 
 class CommandBuffer {
-    static constexpr size_t BUFFER_CAPACITY = 2 * 1024 * 1024; // 2MB Page
-    std::unique_ptr<std::byte[]> buffer;
-
-    // atomic for command insertion offsets
-    std::atomic<size_t> write_offset{0};
-
-    using ExecFn = void(*)(World&, std::byte*);
-
-    struct CommandHeader {
-        ExecFn exec;
-        size_t size;
+    struct IQueue {
+        virtual ~IQueue() = default;
+        virtual void execute(World& world) = 0;
+        virtual void clear() = 0;
+        [[nodiscard]] virtual bool empty() const = 0;
     };
 
-    static size_t align_up(size_t size, size_t alignment = alignof(std::max_align_t)) {
-        return (size + alignment - 1) & ~(alignment - 1);
+    template <IsValidComponent T>
+    struct TypedQueue final : IQueue {
+        std::vector<std::pair<Entity, T>> adds;
+        std::vector<Entity> removes;
+
+        void execute(World& world) override {
+            // compiler will fully inline world functions here
+            for (auto& [e, data] : adds) {
+                world.add<T>(e, std::move(data));
+            }
+            for (Entity e : removes) {
+                world.remove<T>(e);
+            }
+        }
+
+        void clear() override {
+            adds.clear();
+            removes.clear();
+        }
+
+        [[nodiscard]] bool empty() const override {
+            return adds.empty() && removes.empty();
+        }
+    };
+
+    std::vector<Entity> destroy_queue;
+    std::vector<std::unique_ptr<IQueue>> queues;
+    std::vector<size_t> component_to_queue;
+
+    template <IsValidComponent T>
+    TypedQueue<T>& get_queue() {
+        ComponentID cid = ComponentType<T>::id();
+
+        if (cid >= component_to_queue.size()) {
+            component_to_queue.resize(cid + 1, std::numeric_limits<size_t>::max());
+        }
+
+        if (component_to_queue[cid] == std::numeric_limits<size_t>::max()) {
+            component_to_queue[cid] = queues.size();
+            queues.push_back(std::make_unique<TypedQueue<T>>());
+        }
+
+        return static_cast<TypedQueue<T>&>(*queues[component_to_queue[cid]]);
     }
 
 public:
-    CommandBuffer() : buffer(new std::byte[BUFFER_CAPACITY]) {}
+    CommandBuffer() = default;
+
+    CommandBuffer(const CommandBuffer&) = delete;
+    CommandBuffer& operator=(const CommandBuffer&) = delete;
+
+    CommandBuffer(CommandBuffer&&) = default;
+    CommandBuffer& operator=(CommandBuffer&&) = default;
 
     template <IsValidComponent T>
     void deferred_add(Entity e, T data) {
-        // defines what is being stored in the buffer
-        struct Payload {
-            Entity e;
-            T data;
-        };
-
-        size_t payload_size = sizeof(CommandHeader) + sizeof(Payload);
-        size_t alloc_size = align_up(payload_size);
-
-        // keeps this lock free
-        size_t current_offset = write_offset.fetch_add(alloc_size, std::memory_order_relaxed);
-        assert(current_offset + alloc_size <= BUFFER_CAPACITY && "CommandBuffer overflow!");
-
-        std::byte* cmd_ptr = buffer.get() + current_offset;
-
-        // write the header
-        auto* header = reinterpret_cast<CommandHeader*>(cmd_ptr);
-        header->size = alloc_size;
-
-        // static lambda acts as function pointer
-        header->exec = [](World& world, std::byte* ptr) {
-            auto* payload = reinterpret_cast<Payload*>(ptr + sizeof(CommandHeader));
-            world.add<T>(payload->e, std::move(payload->data));
-            // explicitly calls the deconstructor because there is a chance memory was allocated internally
-            payload->~Payload();
-        };
-
-        // write the payload
-        new (cmd_ptr + sizeof(CommandHeader)) Payload{e, std::move(data)};
-    }
-
-    void deferred_destroy(Entity e) {
-        size_t alloc_size = align_up(sizeof(CommandHeader) + sizeof(Entity));
-        size_t current_offset = write_offset.fetch_add(alloc_size, std::memory_order_relaxed);
-        assert(current_offset + alloc_size <= BUFFER_CAPACITY && "CommandBuffer overflow!");
-
-        std::byte* cmd_ptr = buffer.get() + current_offset;
-
-        auto* header = reinterpret_cast<CommandHeader*>(cmd_ptr);
-        header->size = alloc_size;
-        header->exec = [](World& world, std::byte* ptr) {
-            auto* entity_ptr = reinterpret_cast<Entity*>(ptr + sizeof(CommandHeader));
-            world.destroy(*entity_ptr);
-        };
-
-        new (cmd_ptr + sizeof(CommandHeader)) Entity{e};
+        get_queue<T>().adds.emplace_back(e, std::move(data));
     }
 
     template <IsValidComponent T>
     void deferred_remove(Entity e) {
-        size_t alloc_size = align_up(sizeof(CommandHeader) + sizeof(Entity));
-        size_t current_offset = write_offset.fetch_add(alloc_size, std::memory_order_relaxed);
-        assert(current_offset + alloc_size <= BUFFER_CAPACITY && "CommandBuffer overflow!");
+        get_queue<T>().removes.push_back(e);
+    }
 
-        std::byte* cmd_ptr = buffer.get() + current_offset;
-
-        auto* header = reinterpret_cast<CommandHeader*>(cmd_ptr);
-        header->size = alloc_size;
-        header->exec = [](World& world, std::byte* ptr) {
-            auto* entity_ptr = reinterpret_cast<Entity*>(ptr + sizeof(CommandHeader));
-            world.remove<T>(*entity_ptr);
-        };
-
-        new (cmd_ptr + sizeof(CommandHeader)) Entity{e};
+    void deferred_destroy(Entity e) {
+        destroy_queue.push_back(e);
     }
 
     void execute(World& world) {
-        size_t end_offset = write_offset.load(std::memory_order_acquire);
-        size_t current = 0;
-
-        // go through the byte buffer
-        while (current < end_offset) {
-            std::byte* cmd_ptr = buffer.get() + current;
-            auto* header = reinterpret_cast<CommandHeader*>(cmd_ptr);
-
-            // execute each function pointer
-            header->exec(world, cmd_ptr);
-
-            // jump to the next command
-            current += header->size;
+        for (auto& q : queues) {
+            if (!q->empty()) {
+                q->execute(world);
+            }
         }
 
-        // reset the buffer for the next frame
+        for (Entity e : destroy_queue) {
+            world.destroy(e);
+        }
+
         clear();
     }
 
     void clear() {
-        // CANNOT call this without calling execute first, it WILL cause memory leaks if ANY component has a complex deconstructor
-        write_offset.store(0, std::memory_order_release);
+        for (auto& q : queues) {
+            q->clear();
+        }
+        destroy_queue.clear();
     }
 
     [[nodiscard]] bool empty() const {
-        return write_offset.load(std::memory_order_relaxed) == 0;
+        for (const auto& q : queues) {
+            if (!q->empty()) return false;
+        }
+        return destroy_queue.empty();
     }
-
 };
 
 }

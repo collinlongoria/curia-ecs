@@ -148,10 +148,24 @@ public:
 
         if (record.archetype->has_component(cid)) return;
 
-        std::vector<ComponentID> new_sig = record.archetype->signature;
-        new_sig.push_back(cid);
+        Archetype* dst = nullptr;
 
-        Archetype* dst = find_or_create_archetype(std::move(new_sig));
+        // Check the graph for a cached transition
+        auto it = record.archetype->add_edges.find(cid);
+        if (it != record.archetype->add_edges.end()) {
+            dst = it->second;
+        }
+        else {
+            // build new signature and find/create archetype
+            std::vector<ComponentID> new_sig = record.archetype->signature;
+            new_sig.push_back(cid);
+
+            dst = find_or_create_archetype(std::move(new_sig));
+
+            // Cache the transition bidirectionally for future use
+            record.archetype->add_edges[cid] = dst;
+            dst->remove_edges[cid] = record.archetype;
+        }
 
         move_entity(e, record, dst);
 
@@ -169,16 +183,30 @@ public:
 
         if (!record.archetype->has_component(cid)) return;
 
-        std::vector<ComponentID> new_sig;
-        for (auto c : record.archetype->signature) {
-            if (c != cid) new_sig.push_back(c);
-        }
+        Archetype* dst = nullptr;
 
-        Archetype* dst;
-        if (new_sig.empty()) {
-            dst = empty_archetype;
-        } else {
-            dst = find_or_create_archetype(std::move(new_sig));
+        // Check the graph for a cached transition
+        auto it = record.archetype->remove_edges.find(cid);
+        if (it != record.archetype->remove_edges.end()) {
+            dst = it->second;
+        }
+        else {
+            // Build new signature and find/create archetype
+            std::vector<ComponentID> new_sig;
+            for (auto c : record.archetype->signature) {
+                if (c != cid) new_sig.push_back(c);
+            }
+
+            if (new_sig.empty()) {
+                dst = empty_archetype;
+            }
+            else {
+                dst = find_or_create_archetype(std::move(new_sig));
+            }
+
+            // Cache the transition for future use
+            record.archetype->remove_edges[cid] = dst;
+            dst->add_edges[cid] = record.archetype;
         }
 
         move_entity(e, record, dst);

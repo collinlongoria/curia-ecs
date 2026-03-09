@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "chunk.hpp"
@@ -26,6 +27,10 @@ struct Archetype {
 
     uint32_t entities_per_chunk = 0;
     size_t row_stride = 0;
+
+    // Graph edges
+    std::unordered_map<ComponentID, Archetype*> add_edges;
+    std::unordered_map<ComponentID, Archetype*> remove_edges;
 
     void ensure_flat_size(ComponentID cid) {
         if (cid >= component_offsets.size()) {

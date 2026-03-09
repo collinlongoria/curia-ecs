@@ -14,6 +14,7 @@ namespace curia {
 template <typename... Components>
 class Query {
     std::vector<Archetype*> matching_archetypes;
+    size_t processed_archetypes = 0;
 
     static bool archetype_matches(const Archetype* arch) {
         return (arch->has_component(ComponentType<Components>::id()) && ...);
@@ -21,12 +22,14 @@ class Query {
 
 public:
     void refresh(const std::vector<std::unique_ptr<Archetype>>& all_archetypes) {
-        matching_archetypes.clear();
-        for (auto& a : all_archetypes) {
-            if (archetype_matches(a.get())) {
-                matching_archetypes.push_back(a.get());
+        // only evaluate brand new archetypes made since last refresh
+        for (size_t i = processed_archetypes; i < all_archetypes.size(); ++i) {
+            if (archetype_matches(all_archetypes[i].get())) {
+                matching_archetypes.push_back(all_archetypes[i].get());
             }
         }
+        // update tracker so these are never evaluated again
+        processed_archetypes = all_archetypes.size();
     }
 
     // single-threaded iteration
