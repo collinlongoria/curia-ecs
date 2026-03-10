@@ -19,6 +19,9 @@ struct Rotation {
     float axis_x, axis_y, axis_z;
 };
 
+// NEW: Zero-sized tag for benchmarking ZST logic
+struct IsActive {};
+
 // entity creation
 static void BM_EntityCreation(benchmark::State& state) {
     for (auto _ : state) {
@@ -31,7 +34,7 @@ static void BM_EntityCreation(benchmark::State& state) {
 }
 BENCHMARK(BM_EntityCreation)->RangeMultiplier(10)->Range(10000, 1000000);
 
-// entity creation + immediate structural add (tests the Archetype Graph)
+// entity creation + immediate structural add
 static void BM_EntityCreateWithComponents(benchmark::State& state) {
     for (auto _ : state) {
         curia::World world;
@@ -45,25 +48,22 @@ static void BM_EntityCreateWithComponents(benchmark::State& state) {
 }
 BENCHMARK(BM_EntityCreateWithComponents)->RangeMultiplier(10)->Range(10000, 1000000);
 
-// NEW: tests the Batched Command Buffer throughput
+// tests the Batched Command Buffer throughput
 static void BM_CommandBufferAdd(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
         curia::World world;
-        curia::CommandBuffer cmd; // The optimized command buffer
+        curia::CommandBuffer cmd;
         std::vector<curia::Entity> entities;
         for (int64_t i = 0; i < state.range(0); ++i) {
             entities.push_back(world.create());
         }
         state.ResumeTiming();
 
-        // Benchmark deferred enqueueing
         for (auto e : entities) {
             cmd.deferred_add<Position>(e, {0, 0, 0});
             cmd.deferred_add<Velocity>(e, {1, 1, 1});
         }
-
-        // Benchmark batched execution
         cmd.execute(world);
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
@@ -79,7 +79,6 @@ static void BM_IteratePositionVelocity(benchmark::State& state) {
         world.add<Velocity>(e, {1, 1, 1});
     }
 
-    // FIXED: Query is cached outside the hot loop
     auto q = world.query<Position, Velocity>();
 
     for (auto _ : state) {
@@ -102,7 +101,6 @@ static void BM_ParIteratePositionVelocity(benchmark::State& state) {
         world.add<Velocity>(e, {1, 1, 1});
     }
 
-    // FIXED: Query is cached outside the hot loop
     auto q = world.query<Position, Velocity>();
 
     for (auto _ : state) {
@@ -186,7 +184,6 @@ static void BM_IterateWideArchetype(benchmark::State& state) {
         world.add<Rotation>(e, {0, 0, 1, 0});
     }
 
-    // FIXED: Query is cached outside the hot loop
     auto q = world.query<Position, Velocity, Health>();
 
     for (auto _ : state) {
@@ -200,5 +197,70 @@ static void BM_IterateWideArchetype(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * state.range(0));
 }
 BENCHMARK(BM_IterateWideArchetype)->RangeMultiplier(10)->Range(10000, 1000000);
+
+
+// NEW: ZST Addition (Tests archetype graph migration without memcpy cost)
+static void BM_AddZST(benchmark::State& state) {
+    for (auto _ : state) {
+        state.PauseTiming();
+        curia::World world;
+        std::vector<curia::Entity> entities;
+        for (int64_t i = 0; i < state.range(0); ++i) {
+            auto e = world.create();
+            world.add<Position>(e, {0, 0, 0});
+            entities.push_back(e);
+        }
+        state.ResumeTiming();
+        for (auto e : entities) {
+            world.add<IsActive>(e, {});
+        }
+    }
+    state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+BENCHMARK(BM_AddZST)->RangeMultiplier(10)->Range(10000, 1000000);
+
+// NEW: ZST Iteration (Tests chunk dummy array extraction efficiency)
+static void BM_IterateWithZST(benchmark::State& state) {
+    curia::World world;
+    for (int64_t i = 0; i < state.range(0); ++i) {
+        auto e = world.create();
+        world.add<Position>(e, {0, 0, 0});
+        world.add<Velocity>(e, {1, 1, 1});
+        world.add<IsActive>(e, {});
+    }
+
+    auto q = world.query<Position, Velocity, IsActive>();
+
+    for (auto _ : state) {
+        q.each([](Position& pos, Velocity& vel, IsActive&) {
+            pos.x += vel.dx;
+            pos.y += vel.dy;
+            pos.z += vel.dz;
+        });
+    }
+    state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+BENCHMARK(BM_IterateWithZST)->RangeMultiplier(10)->Range(10000, 1000000);
+
+// NEW: Observer Trigger Overhead (Measures std::function penalty during structural changes)
+static void BM_AddComponentWithObserver(benchmark::State& state) {
+    for (auto _ : state) {
+        state.PauseTiming();
+        curia::World world;
+        world.observe_add<IsActive>([](curia::Entity) { /* Empty observer */ });
+        std::vector<curia::Entity> entities;
+        for (int64_t i = 0; i < state.range(0); ++i) {
+            auto e = world.create();
+            world.add<Position>(e, {0, 0, 0});
+            entities.push_back(e);
+        }
+        state.ResumeTiming();
+        for (auto e : entities) {
+            world.add<IsActive>(e, {});
+        }
+    }
+    state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+BENCHMARK(BM_AddComponentWithObserver)->RangeMultiplier(10)->Range(10000, 1000000);
 
 BENCHMARK_MAIN();

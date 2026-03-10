@@ -1,0 +1,255 @@
+Adding Zero-Sized Tags (ZSTs) is a fantastic architectural upgrade. In an Archetype ECS, using empty structs (like struct IsFalling {};) as flags is the optimal way to manage boolean states. It automatically groups flagged entities into dedicated archetypes, meaning your queries can filter them instantly without ever checking an if (is_falling) condition inside the loop.
+Because your components are strictly checked by IsValidComponent, C++ treats empty structs as having a sizeof(T) == 1. To achieve true zero-cost tags, we need to explicitly intercept these empty types, register their size as 0, and bypass memory allocations and memcpy operations entirely.
+Here is exactly how to update your engine to support this without changing your user-facing API.
+1. Update archetype.hpp
+We need to protect your memory operations from executing on zero-sized components. In C++, std::memcpy with a size of 0 is a no-op, but skipping the math and function call entirely is safer and faster.
+Add a simple if (sz == 0) check to your data movement methods:
+
+C++
+
+
+    void copy_component(ComponentID cid,
+                        Chunk* dst_chunk, uint32_t dst_row,
+                        const Chunk* src_chunk, uint32_t src_row,
+                        const Archetype& src_arch) const {
+        size_t sz = component_sizes[cid]; //
+        if (sz == 0) return; // ZST fast-path
+
+        size_t dst_off = component_offsets[cid] + dst_row * sz; //
+        size_t src_off = src_arch.component_offsets[cid] + src_row * sz; //
+        std::memcpy(dst_chunk->data + dst_off, src_chunk->data + src_off, sz); //
+    }
+
+    void write_component(ComponentID cid, Chunk* chunk, uint32_t row, const void* data) {
+        size_t sz = component_sizes[cid]; //
+        if (sz == 0) return; // ZST fast-path
+
+        size_t off = component_offsets[cid] + row * sz; //
+        std::memcpy(chunk->data + off, data, sz); //
+    }
+
+    void read_component(ComponentID cid, const Chunk* chunk, uint32_t row, void* out) const {
+        size_t sz = component_sizes[cid]; //
+        if (sz == 0) return; // ZST fast-path
+
+        size_t off = component_offsets[cid] + row * sz; //
+        std::memcpy(out, chunk->data + off, sz); //
+    }
+
+    Entity remove_row(uint32_t chunk_idx, uint32_t row) {
+        Chunk* chunk = chunks[chunk_idx].get(); //
+        uint32_t last = chunk->entity_count - 1; //
+        Entity moved = INVALID_ENTITY; //
+
+        if (row != last) { //
+            for (auto cid : signature) { //
+                size_t sz = component_sizes[cid]; //
+                if (sz == 0) continue; // ZST fast-path
+
+                size_t row_off = component_offsets[cid] + row * sz; //
+                size_t last_off = component_offsets[cid] + last * sz; //
+                std::memcpy(chunk->data + row_off, chunk->data + last_off, sz); //
+            }
+            moved = entities_in_chunk[chunk_idx][last]; //
+            entities_in_chunk[chunk_idx][row] = moved; //
+        }
+
+        entities_in_chunk[chunk_idx].pop_back(); //
+        chunk->entity_count--; //
+        return moved; //
+    }
+
+
+2. Update world.hpp
+Next, we intercept sizeof(T) when adding components. If std::is_empty_v<T> is true, we register the size as 0 instead.
+
+C++
+
+
+    template <IsValidComponent T>
+    void add(Entity e, T component_data) {
+        // ... (Keep your existing assertions and record lookup) ...
+
+        ComponentID cid = ComponentType<T>::id(); //
+        
+        // ZST check: Register size 0 for empty structs
+        size_t actual_size = std::is_empty_v<T> ? 0 : sizeof(T);
+        register_component_size(cid, actual_size); 
+
+        // ... (Keep your existing Graph Edge checks and move_entity logic) ...
+
+        // Only write data if it actually has a size
+        if constexpr (!std::is_empty_v<T>) {
+            Chunk* chunk = dst->chunks[record.chunk_index].get();
+            dst->write_component(cid, chunk, record.row_index, &component_data);
+        }
+    }
+
+    template <IsValidComponent T>
+    T* get(Entity e) {
+        if (!alive(e)) return nullptr; //
+        uint32_t idx = EntityTraits::get_index(e); //
+        EntityRecord& record = entity_directory[idx]; //
+        ComponentID cid = ComponentType<T>::id(); //
+        if (!record.archetype->has_component(cid)) return nullptr; //
+
+        // ZST fast-path: Return a pointer to a static dummy instance
+        if constexpr (std::is_empty_v<T>) {
+            static thread_local T zst_dummy{};
+            return &zst_dummy;
+        }
+
+        Chunk* chunk = record.archetype->chunks[record.chunk_index].get(); //
+        size_t offset = record.archetype->component_offsets[cid] //
+                      + record.row_index * sizeof(T); //
+        return reinterpret_cast<T*>(chunk->data + offset); //
+    }
+    
+    // (Apply the exact same constexpr check to const T* get(Entity e) const)
+
+    template <IsValidComponent T>
+    void set(Entity e, T component_data) {
+        if constexpr (std::is_empty_v<T>) return; // ZSTs have no data to set
+        T* ptr = get<T>(e); //
+        if (ptr) *ptr = component_data; //
+    }
+
+
+3. Update query.hpp (The Magic Trick)
+If a user writes q.par_each([](Position& p, IsFalling& f)), C++ requires f to be a valid reference, but we no longer allocate arrays for it!
+To solve this without breaking your tuple extraction, we can create a single, thread-local global array of dummy bytes. When the query tuple asks for a ZST array, we just hand it the dummy array. Because we use thread_local, it is 100% thread-safe even during parallel iteration.
+
+C++
+
+
+namespace curia {
+
+namespace detail {
+    // A single thread-local buffer to safely back ZST references without data races
+    inline thread_local std::byte zst_dummy_array[Chunk::CHUNK_SIZE];
+}
+
+template <typename... Components>
+class Query {
+    // ... (Keep your matching_archetypes and refresh method) ...
+
+    // single-threaded iteration
+    template <typename Func>
+    void each(Func&& callback) {
+        for (Archetype* arch : matching_archetypes) { //
+            for (auto& chunk_ptr : arch->chunks) { //
+                Chunk* chunk = chunk_ptr.get(); //
+                
+                // ZST Intercept: swap in the dummy array for empty types
+                auto arrays = std::make_tuple(
+                    (std::is_empty_v<Components> 
+                        ? reinterpret_cast<Components*>(detail::zst_dummy_array) 
+                        : static_cast<Components*>(chunk->get_array(arch->component_offsets[ComponentType<Components>::id()])))...
+                );
+                
+                for (uint32_t i = 0; i < chunk->entity_count; ++i) { //
+                    callback(std::get<Components*>(arrays)[i]...); //
+                } //
+            } //
+        } //
+    }
+
+    // (Apply the exact same 'arrays' tuple intercept to par_each and each_with_entity)
+
+
+With this update, you can now do world.add(e, IsPineapple{});, and the ECS will instantly map the entity into the IsPineapple archetype space without consuming a single byte of chunk memory or spending CPU cycles copying dummy data around!
+Would you like to build an Observer mechanism next so you can trigger callbacks strictly when an entity gains or loses one of these tags?
+
+Building an Observer system right after adding Zero-Sized Tags (ZSTs) is the perfect move. By combining the two, you can implement event-driven logic (like triggering a sound effect exactly when an entity gains the IsFalling tag) without having to iterate through all entities every frame to check their state.
+To keep your ECS incredibly fast, we want to hook these observers directly into the World's structural change functions. Since component additions and removals already happen through a centralized chokepoint (world.add<T> and world.remove<T>), we can intercept the transition exactly as it happens.
+Here is how to implement a lightning-fast, array-backed Observer system.
+1. Add Observer Storage to World
+In world.hpp, we will use a sparse array of std::vector to map a ComponentID directly to a list of callbacks. Because ComponentID is a dense, sequential integer, this lookup is a direct $O(1)$ array access.
+Add the following to the private section of your World class:
+C++
+#include <functional> // Add this to the top of world.hpp
+
+class World {
+    // ... existing private members ...
+
+    // Sparse arrays mapping ComponentID to a list of callback functions
+    std::vector<std::vector<std::function<void(Entity)>>> on_add_observers;
+    std::vector<std::vector<std::function<void(Entity)>>> on_remove_observers;
+
+    // ... existing methods ...
+};
+
+2. Add Registration Methods
+Next, provide a clean public API for users to register their callbacks. These methods will dynamically resize the sparse arrays to ensure the ComponentID fits safely.
+Add these to the public section of World:
+C++
+public:
+    // ... existing public methods ...
+
+    template <IsValidComponent T>
+    void observe_add(std::function<void(Entity)> callback) {
+        ComponentID cid = ComponentType<T>::id();
+        if (cid >= on_add_observers.size()) {
+            on_add_observers.resize(cid + 1);
+        }
+        on_add_observers[cid].push_back(std::move(callback));
+    }
+
+    template <IsValidComponent T>
+    void observe_remove(std::function<void(Entity)> callback) {
+        ComponentID cid = ComponentType<T>::id();
+        if (cid >= on_remove_observers.size()) {
+            on_remove_observers.resize(cid + 1);
+        }
+        on_remove_observers[cid].push_back(std::move(callback));
+    }
+
+3. Trigger the Callbacks
+Finally, we inject the trigger logic at the very end of your existing add and remove functions, after the entity has successfully been migrated in the archetype graph.
+Update world.add<T>:
+C++
+   template <IsValidComponent T>
+    void add(Entity e, T component_data) {
+        // ... (Keep your existing graph logic and memory copying) ...
+        
+        if constexpr (!std::is_empty_v<T>) { //
+            Chunk* chunk = dst->chunks[record.chunk_index].get(); //
+            dst->write_component(cid, chunk, record.row_index, &component_data); //
+        }
+
+        // NEW: Trigger Add Observers
+        if (cid < on_add_observers.size()) {
+            for (const auto& callback : on_add_observers[cid]) {
+                callback(e);
+            }
+        }
+    }
+
+Update world.remove<T>:
+C++
+   template <IsValidComponent T>
+    void remove(Entity e) {
+        // ... (Keep your existing graph logic and entity moving) ...
+
+        // NEW: Trigger Remove Observers
+        if (cid < on_remove_observers.size()) {
+            for (const auto& callback : on_remove_observers[cid]) {
+                callback(e);
+            }
+        }
+    }
+
+
+Critical Guardrail: Re-entrancy
+Note on Safety: You'll notice the callback signature is std::function<void(Entity)> rather than void(World&, Entity). This is highly intentional.
+If a user were to call world.add<OtherComponent>(e) inside an observer callback that was triggered by world.add<ZST>(e), it would cause re-entrancy. The World would attempt to move the entity to a new archetype while it is currently in the middle of resolving the first archetype move, heavily corrupting your chunk memory and entity directory.
+The Solution: If you need to add or remove components in response to an event, capture your per-thread CommandBuffer in the lambda and queue the changes there instead!
+C++
+// Safe Observer Usage Example
+world.observe_add<IsFalling>([&cmd_buffer](curia::Entity e) {
+    // Correct: Queueing structural changes to happen safely at the end of the frame
+    cmd_buffer.deferred_remove<IsGrounded>(e);
+});
+
+Would you like me to walk you through standardizing a System interface and a Scheduler so that you can automatically run queries and command buffer executions across a thread pool in the correct dependency order?
+
