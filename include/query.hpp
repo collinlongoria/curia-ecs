@@ -11,11 +11,6 @@
 
 namespace curia {
 
-namespace detail {
-    // dummy array for 0-size reference returns
-    inline thread_local std::byte dummy_array[Chunk::CHUNK_SIZE];
-}
-
 template <typename... Components>
 class Query {
     std::vector<Archetype*> matching_archetypes;
@@ -43,14 +38,10 @@ public:
         for (Archetype* arch : matching_archetypes) {
             for (auto& chunk_ptr : arch->chunks) {
                 Chunk* chunk = chunk_ptr.get();
-
-                // with zero size tag intercept
                 auto arrays = std::make_tuple(
-                    (std::is_empty_v<Components>
-                        ? reinterpret_cast<Components*>(detail::dummy_array)
-                        : static_cast<Components*>(chunk->get_array(arch->component_offsets[ComponentType<Components>::id()])))...
+                    static_cast<Components*>(chunk->get_array(
+                        arch->component_offsets[ComponentType<Components>::id()]))...
                 );
-
                 for (uint32_t i = 0; i < chunk->entity_count; ++i) {
                     callback(std::get<Components*>(arrays)[i]...);
                 }
@@ -72,9 +63,8 @@ public:
             [&](std::pair<Archetype*, Chunk*> item) {
                 auto [arch, chunk] = item;
                 auto arrays = std::make_tuple(
-                    (std::is_empty_v<Components>
-                        ? reinterpret_cast<Components*>(detail::dummy_array)
-                        : static_cast<Components*>(chunk->get_array(arch->component_offsets[ComponentType<Components>::id()])))...
+                    static_cast<Components*>(chunk->get_array(
+                        arch->component_offsets[ComponentType<Components>::id()]))...
                 );
                 for (uint32_t i = 0; i < chunk->entity_count; ++i) {
                     callback(std::get<Components*>(arrays)[i]...);
@@ -90,9 +80,8 @@ public:
             for (uint32_t ci = 0; ci < arch->chunks.size(); ++ci) {
                 Chunk* chunk = arch->chunks[ci].get();
                 auto arrays = std::make_tuple(
-                    (std::is_empty_v<Components>
-                        ? reinterpret_cast<Components*>(detail::dummy_array)
-                        : static_cast<Components*>(chunk->get_array(arch->component_offsets[ComponentType<Components>::id()])))...
+                    static_cast<Components*>(chunk->get_array(
+                        arch->component_offsets[ComponentType<Components>::id()]))...
                 );
                 for (uint32_t i = 0; i < chunk->entity_count; ++i) {
                     Entity e = arch->entities_in_chunk[ci][i];

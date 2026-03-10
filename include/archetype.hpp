@@ -83,9 +83,11 @@ struct Archetype {
         return {static_cast<uint32_t>(chunks.size() - 1), 0};
     }
 
-    void copy_component(ComponentID cid, Chunk* dst_chunk, uint32_t dst_row, const Chunk* src_chunk, uint32_t src_row, const Archetype& src_arch) const {
+    void copy_component(ComponentID cid,
+                        Chunk* dst_chunk, uint32_t dst_row,
+                        const Chunk* src_chunk, uint32_t src_row,
+                        const Archetype& src_arch) const {
         size_t sz = component_sizes[cid];
-        if (sz == 0) return; // tag path
         size_t dst_off = component_offsets[cid] + dst_row * sz;
         size_t src_off = src_arch.component_offsets[cid] + src_row * sz;
         std::memcpy(dst_chunk->data + dst_off, src_chunk->data + src_off, sz);
@@ -93,14 +95,12 @@ struct Archetype {
 
     void write_component(ComponentID cid, Chunk* chunk, uint32_t row, const void* data) {
         size_t sz = component_sizes[cid];
-        if (sz == 0) return; // tag path
         size_t off = component_offsets[cid] + row * sz;
         std::memcpy(chunk->data + off, data, sz);
     }
 
     void read_component(ComponentID cid, const Chunk* chunk, uint32_t row, void* out) const {
         size_t sz = component_sizes[cid];
-        if (sz == 0) return; // tag path
         size_t off = component_offsets[cid] + row * sz;
         std::memcpy(out, chunk->data + off, sz);
     }
@@ -113,8 +113,6 @@ struct Archetype {
         if (row != last) {
             for (auto cid : signature) {
                 size_t sz = component_sizes[cid];
-                if (sz == 0) continue; // tag path
-
                 size_t row_off = component_offsets[cid] + row * sz;
                 size_t last_off = component_offsets[cid] + last * sz;
                 std::memcpy(chunk->data + row_off, chunk->data + last_off, sz);

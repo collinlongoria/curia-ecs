@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
-#include <functional>
 #include <memory>
 #include <vector>
 
@@ -32,10 +31,6 @@ class World {
 
     // global flat array of component sizes, indexed by ComponentID
     std::vector<size_t> global_component_sizes;
-
-    // call back functions for observers
-    std::vector<std::vector<std::function<void(Entity)>>> on_add_observer;
-    std::vector<std::vector<std::function<void(Entity)>>> on_remove_observer;
 
     void register_component_size(ComponentID cid, size_t sz) {
         if (cid >= global_component_sizes.size()) {
@@ -149,8 +144,7 @@ public:
         EntityRecord& record = entity_directory[idx];
 
         ComponentID cid = ComponentType<T>::id();
-        size_t actual_size = std::is_empty_v<T> ? 0 : sizeof(T);
-        register_component_size(cid, actual_size);
+        register_component_size(cid, sizeof(T));
 
         if (record.archetype->has_component(cid)) return;
 
@@ -175,16 +169,8 @@ public:
 
         move_entity(e, record, dst);
 
-        if constexpr (!std::is_empty_v<T>) { // only perform write data if actually has a size
-            Chunk* chunk = dst->chunks[record.chunk_index].get();
-            dst->write_component(cid, chunk, record.row_index, &component_data);
-        }
-
-        if (cid < on_add_observer.size()) {
-            for (const auto& callback : on_add_observer[cid]) {
-                callback(e);
-            }
-        }
+        Chunk* chunk = dst->chunks[record.chunk_index].get();
+        dst->write_component(cid, chunk, record.row_index, &component_data);
     }
 
     template <IsValidComponent T>
@@ -224,13 +210,6 @@ public:
         }
 
         move_entity(e, record, dst);
-
-        // trigger remove observe
-        if (cid < on_remove_observer.size()) {
-            for (const auto& callback : on_remove_observer[cid]) {
-                callback(e);
-            }
-        }
     }
 
     template <IsValidComponent T>
@@ -249,12 +228,6 @@ public:
         ComponentID cid = ComponentType<T>::id();
         if (!record.archetype->has_component(cid)) return nullptr;
 
-        // tag returns static dummy instance
-        if constexpr (std::is_empty_v<T>) {
-            static thread_local T dummy{};
-            return &dummy;
-        }
-
         Chunk* chunk = record.archetype->chunks[record.chunk_index].get();
         size_t offset = record.archetype->component_offsets[cid]
                       + record.row_index * sizeof(T);
@@ -269,11 +242,6 @@ public:
         ComponentID cid = ComponentType<T>::id();
         if (!record.archetype->has_component(cid)) return nullptr;
 
-        if constexpr (std::is_empty_v<T>) {
-            static thread_local T dummy{};
-            return &dummy;
-        }
-
         const Chunk* chunk = record.archetype->chunks[record.chunk_index].get();
         size_t offset = record.archetype->component_offsets[cid]
                       + record.row_index * sizeof(T);
@@ -282,7 +250,6 @@ public:
 
     template <IsValidComponent T>
     void set(Entity e, T component_data) {
-        if constexpr (std::is_empty_v<T>) return; // no data to set on tags
         T* ptr = get<T>(e);
         if (ptr) *ptr = component_data;
     }
@@ -310,25 +277,6 @@ public:
 
     const std::vector<std::unique_ptr<Archetype>>& get_archetypes() const {
         return archetypes;
-    }
-
-    // observer methods
-    template<IsValidComponent T>
-    void observe_add(std::function<void(Entity)> callback) {
-        ComponentID cid = ComponentType<T>::id();
-        if (cid >= on_add_observer.size()) {
-            on_add_observer.resize(cid + 1);
-        }
-        on_add_observer[cid].push_back(std::move(callback));
-    }
-
-    template<IsValidComponent T>
-    void observe_remove(std::function<void(Entity)> callback) {
-        ComponentID cid = ComponentType<T>::id();
-        if (cid >= on_remove_observer.size()) {
-            on_remove_observer.resize(cid + 1);
-        }
-        on_remove_observer[cid].push_back(std::move(callback));
     }
 };
 
