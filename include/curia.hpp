@@ -8,5 +8,6 @@
 #include "world.hpp"
 #include "query.hpp"
 #include "command_buffer.hpp"
+#include "scheduler.hpp"
 
 #endif //CURIA_HPP

@@ -180,6 +180,58 @@ int main() {
     // 5000 from bulk + e2(has Pos) + e4(has Pos) + zst_e(has Pos) = 5003
     assert(alive_count == 5003);
 
+    // --- Scheduler & Dependency Graph Tests ---
+    curia::Scheduler scheduler(world);
+
+    // This system writes to Velocity
+    scheduler.add_system("GravitySystem")
+        .writes<Velocity>()
+        .execute([](curia::World& w, curia::CommandBuffer& cmd) {
+            auto q = w.query<Velocity>();
+            q.par_each([](Velocity& vel) {
+                vel.dy -= 9.8f;
+            });
+        });
+
+    // This system reads Velocity and writes to Position (Must run AFTER GravitySystem)
+    scheduler.add_system("MovementSystem")
+        .reads<Velocity>()
+        .writes<Position>()
+        .execute([](curia::World& w, curia::CommandBuffer& cmd) {
+            auto q = w.query<Position, Velocity>();
+            q.par_each([](Position& pos, Velocity& vel) {
+                pos.x += vel.dx;
+                pos.y += vel.dy;
+                pos.z += vel.dz;
+            });
+        });
+
+    // This system only interacts with Health (No conflicts! Can run concurrently with Phase 0)
+    scheduler.add_system("HealthRegenSystem")
+        .writes<Health>()
+        .execute([](curia::World& w, curia::CommandBuffer& cmd) {
+            auto q = w.query<Health>();
+            q.par_each([](Health& hp) {
+                if (hp.hp < hp.max_hp) hp.hp++;
+            });
+        });
+
+    // This system uses the command buffer to mark dead entities
+    scheduler.add_system("DeathSystem")
+        .reads<Health>()
+        .execute([](curia::World& w, curia::CommandBuffer& cmd) {
+            auto q = w.query<Health>();
+            q.each_with_entity([&cmd](curia::Entity e, Health& hp) {
+                if (hp.hp <= 0) cmd.deferred_destroy(e);
+            });
+        });
+
+    scheduler.compile();
+    scheduler.print_graph(); // Check your console to see the auto-generated execution order!
+
+    // Run a frame
+    scheduler.run();
+
     std::printf("all tests passed\n");
     return 0;
 }
